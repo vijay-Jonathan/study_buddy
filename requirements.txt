@@ -7,3 +7,4 @@ PyPDF2
 faiss-cpu
 openai
 sentence-transformers
+gradio

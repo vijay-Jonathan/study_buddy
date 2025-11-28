@@ -42,17 +42,33 @@ def get_vector_store(text_chunks):
 def get_conversational_chain():
 
     prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
+    You are a helpful AI assistant for studying documents. Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
     provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
 
+
+    IMPORTANT: Handle conversational follow-ups naturally! If the user asks about previous questions, conversation, or follow-ups, 
+    respond conversationally using the conversation history provided.
+    
+    Conversation History:
+    {conversation_history}
+    
+    Context:
+    {context}
+    
+    Question: {question}
+    
+    Instructions:
+    1. If the question is about the conversation (like "what did I ask before?"), use the conversation history
+    2. If the question is about document content, use the context
+    3. If the question combines both, use both sources
+    4. If information is not available in either source, say it's not available
+    
     Answer:
     """
 
     model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3)
 
-    prompt = PromptTemplate(template = prompt_template, input_variables = ["context", "question"])
+    prompt = PromptTemplate(template = prompt_template, input_variables = ["context", "question", "conversation_history"])
     chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
 
     return chain
@@ -205,7 +221,9 @@ def main():
                 # Get AI response
                 with st.spinner("Thinking..."):
                     try:
-                        response = get_conversational_response(user_question)
+                        # Format conversation history for context
+                        conversation_history = format_conversation_history(st.session_state.chat_history)
+                        response = get_conversational_response(user_question, conversation_history)
                         st.session_state.chat_history.append({"role": "assistant", "content": response})
                     except Exception as e:
                         st.session_state.chat_history.append({
@@ -218,8 +236,26 @@ def main():
         st.info("Please upload and process PDF documents in the sidebar to start chatting.")
 
 
-def get_conversational_response(user_question):
-    """Get response from the conversational chain."""
+def format_conversation_history(chat_history, max_turns=5):
+    """Format recent conversation history for context."""
+    if not chat_history:
+        return "No previous conversation."
+    
+    # Get only the last few turns to avoid context overflow
+    recent_history = chat_history[-max_turns*2:] if len(chat_history) > max_turns*2 else chat_history
+    
+    formatted_history = "Recent conversation:\n"
+    for i, message in enumerate(recent_history):
+        if message["role"] == "user":
+            formatted_history += f"User Question {i//2 + 1}: {message['content']}\n"
+        else:
+            formatted_history += f"Assistant Answer {i//2 + 1}: {message['content']}\n"
+    
+    return formatted_history.strip()
+
+
+def get_conversational_response(user_question, conversation_history=""):
+    """Get response from the conversational chain with memory."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
     
     new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
@@ -227,8 +263,13 @@ def get_conversational_response(user_question):
 
     chain = get_conversational_chain()
     
+    # Include conversation history for context
+    context_with_history = ""
+    if conversation_history:
+        context_with_history = f"Previous conversation:\n{conversation_history}\n\n"
+    
     response = chain(
-        {"input_documents": docs, "question": user_question},
+        {"input_documents": docs, "question": user_question, "conversation_history": context_with_history},
         return_only_outputs=True
     )
     
