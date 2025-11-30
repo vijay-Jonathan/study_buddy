@@ -19,24 +19,67 @@ processed_documents = False
 vector_store = None
 
 def get_pdf_text(pdf_docs):
-    """Extract text from PDFs."""
-    text = ""
+    """Extract text from PDFs with document names."""
+    text_chunks_with_metadata = []
+    
     for pdf in pdf_docs:
+        # Get document name
+        doc_name = getattr(pdf, 'name', 'Unknown Document')
+        if not doc_name or doc_name == 'Unknown Document':
+            doc_name = f"document_{len(text_chunks_with_metadata) + 1}.pdf"
+        
         pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+        
+        # Extract text from each page with metadata
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            if page_text.strip():
+                # Create metadata for this chunk
+                metadata = {
+                    'source': doc_name,
+                    'page': page_num + 1,
+                    'document': doc_name
+                }
+                text_chunks_with_metadata.append({
+                    'text': page_text,
+                    'metadata': metadata
+                })
+    
+    return text_chunks_with_metadata
 
-def get_text_chunks(text):
-    """Split text into manageable chunks."""
+def get_text_chunks(text_chunks_with_metadata):
+    """Split text into manageable chunks while preserving metadata."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    chunks = text_splitter.split_text(text)
-    return chunks
+    
+    all_chunks = []
+    
+    for doc_data in text_chunks_with_metadata:
+        text = doc_data['text']
+        base_metadata = doc_data['metadata']
+        
+        # Split the text
+        chunks = text_splitter.split_text(text)
+        
+        # Create chunk with metadata for each text chunk
+        for i, chunk in enumerate(chunks):
+            chunk_metadata = base_metadata.copy()
+            chunk_metadata['chunk'] = i + 1
+            all_chunks.append({
+                'text': chunk,
+                'metadata': chunk_metadata
+            })
+    
+    return all_chunks
 
-def get_vector_store(text_chunks):
-    """Create and save vector store."""
+def get_vector_store(text_chunks_with_metadata):
+    """Create and save vector store with metadata."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    
+    # Extract texts and create documents with metadata
+    texts = [chunk['text'] for chunk in text_chunks_with_metadata]
+    metadatas = [chunk['metadata'] for chunk in text_chunks_with_metadata]
+    
+    vector_store = FAISS.from_texts(texts, embedding=embeddings, metadatas=metadatas)
     vector_store.save_local("faiss_index")
     return vector_store
 
@@ -102,13 +145,13 @@ def process_documents(files):
         return "Please upload PDF files first.", gr.update(interactive=False)
     
     try:
-        # Extract text from PDFs
-        raw_text = get_pdf_text(files)
-        if raw_text.strip():
-            # Create text chunks
-            text_chunks = get_text_chunks(raw_text)
-            # Create vector store
-            vector_store = get_vector_store(text_chunks)
+        # Extract text from PDFs with metadata
+        text_chunks_with_metadata = get_pdf_text(files)
+        if text_chunks_with_metadata:
+            # Create text chunks with preserved metadata
+            chunks_with_metadata = get_text_chunks(text_chunks_with_metadata)
+            # Create vector store with metadata
+            vector_store = get_vector_store(chunks_with_metadata)
             processed_documents = True
             return f"Successfully processed {len(files)} document(s)!", gr.update(interactive=True)
         else:
@@ -122,7 +165,7 @@ def chat_response(message, history):
     
     if not processed_documents:
         ai_response = "Please upload and process PDF documents first."
-        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": ai_response}]
+        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": ai_response}], "No sources available"
     
     try:
         # Format conversation history for context
@@ -141,11 +184,47 @@ def chat_response(message, history):
         )
         
         ai_response = response["output_text"]
-        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": ai_response}]
+        
+        # Format sources for display
+        sources_text = format_sources_for_display(docs)
+        
+        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": ai_response}], sources_text
         
     except Exception as e:
         error_message = f"Sorry, I encountered an error: {str(e)}"
-        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_message}]
+        return "", history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_message}], "Error occurred while retrieving sources"
+
+def format_sources_for_display(docs):
+    """Format the source documents for display in the sources panel."""
+    if not docs:
+        return "No sources found"
+    
+    sources_text = "**Referenced Sources:**\n\n"
+    
+    for i, doc in enumerate(docs, 1):
+        # Get metadata if available
+        if hasattr(doc, 'metadata') and doc.metadata:
+            # Get document name from metadata
+            doc_name = doc.metadata.get('document', 'Unknown Document')
+            if not doc_name or doc_name == 'Unknown Document':
+                doc_name = doc.metadata.get('source', 'Unknown Document')
+            
+            # Extract actual filename from path
+            if '/' in doc_name:
+                doc_name = doc_name.split('/')[-1]  # Get last part of path
+            
+            # Get page number
+            page_num = doc.metadata.get('page', 'Unknown')
+            if page_num != 'Unknown':
+                page_info = f" (Page {page_num})"
+            else:
+                page_info = ""
+            
+            sources_text += f"**{i}.** {doc_name}{page_info}\n"
+        else:
+            sources_text += f"**{i}.** Unknown Document\n"
+    
+    return sources_text
 
 def clear_chat():
     """Clear the chat history."""
@@ -209,6 +288,15 @@ with gr.Blocks() as demo:
                     scale=4
                 )
                 submit_btn = gr.Button("Send", scale=1)
+        
+        with gr.Column(scale=1):
+            gr.Markdown("## Sources")
+            
+            # Sources display
+            sources_display = gr.Markdown(
+                value="**Sources will appear here**\n\nAsk a question to see referenced documents.",
+                label="Referenced Sources"
+            )
     
     # Event handlers
     process_btn.click(
@@ -220,13 +308,13 @@ with gr.Blocks() as demo:
     msg.submit(
         chat_response,
         inputs=[msg, chatbot],
-        outputs=[msg, chatbot]
+        outputs=[msg, chatbot, sources_display]
     )
     
     submit_btn.click(
         chat_response,
         inputs=[msg, chatbot],
-        outputs=[msg, chatbot]
+        outputs=[msg, chatbot, sources_display]
     )
     
     clear_btn.click(
